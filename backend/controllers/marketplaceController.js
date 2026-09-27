@@ -1,0 +1,715 @@
+import Order from '../models/Order.js';
+import Crop from '../models/Crop.js';
+import mongoose from 'mongoose';
+import { filterLocalCrops, findLocalCropById, createLocalOrder, findLocalOrdersByBuyer, findLocalOrderById, updateLocalCropStock } from '../utils/localData.js';
+
+// @desc    Get marketplace crops (available for consumers)
+// @route   GET /api/marketplace/crops
+// @access  Public
+export const getMarketplaceCrops = async (req, res) => {
+    try {
+        const { category, season, minPrice, maxPrice, search, sort } = req.query;
+
+        let query = {
+            availableForConsumers: true,
+            status: 'approved',
+            stockQuantity: { $gt: 0 },
+        };
+
+        if (category) query.category = category;
+        if (season) query.season = season;
+        if (minPrice || maxPrice) {
+            query.consumerPrice = {};
+            if (minPrice) query.consumerPrice.$gte = parseFloat(minPrice);
+            if (maxPrice) query.consumerPrice.$lte = parseFloat(maxPrice);
+        }
+        if (search) {
+            query.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { description: { $regex: search, $options: 'i' } },
+            ];
+        }
+
+        let sortOption = { createdAt: -1 };
+        if (sort === 'price_low') sortOption = { consumerPrice: 1 };
+        if (sort === 'price_high') sortOption = { consumerPrice: -1 };
+        if (sort === 'popular') sortOption = { views: -1 };
+
+        if (mongoose.connection.readyState !== 1) {
+            const fallback = filterLocalCrops({ ...req.query, status: 'approved' });
+            return res.json({
+                success: true,
+                count: fallback.data.length,
+                data: fallback.data,
+            });
+        }
+
+        const crops = await Crop.find(query)
+            .populate('farmer', 'name phone region rating')
+            .sort(sortOption);
+
+        res.json({
+            success: true,
+            count: crops.length,
+            data: crops,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get single marketplace crop
+// @route   GET /api/marketplace/crops/:id
+// @access  Public
+export const getMarketplaceCrop = async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) {
+            const localCrop = findLocalCropById(req.params.id);
+            if (!localCrop) {
+                return res.status(404).json({ message: 'Crop not found' });
+            }
+
+            return res.json({ success: true, data: localCrop });
+        }
+
+        const crop = await Crop.findById(req.params.id).populate(
+            'farmer',
+            'name email phone address region rating isVerified'
+        );
+
+        if (!crop) {
+            return res.status(404).json({ message: 'Crop not found' });
+        }
+
+        if (!crop.availableForConsumers) {
+            return res.status(400).json({ message: 'This crop is not available for consumers' });
+        }
+
+        // Increment views
+        crop.views += 1;
+        await crop.save();
+
+        res.json({
+            success: true,
+            data: crop,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Place consumer order
+// @route   POST /api/marketplace/orders
+// @access  Private (Consumer)
+export const placeConsumerOrder = async (req, res) => {
+    try {
+        const { items, deliveryAddress, paymentMethod } = req.body;
+
+        if (!items || items.length === 0) {
+            return res.status(400).json({ message: 'No items in order' });
+        }
+
+        let totalAmount = 0;
+        const orderItems = [];
+
+        if (mongoose.connection.readyState !== 1) {
+            for (const item of items) {
+                const crop = findLocalCropById(item.cropId);
+
+                if (!crop || !crop.availableForConsumers) {
+                    return res.status(400).json({ message: `Crop ${item.cropId} not available` });
+                }
+
+                if ((crop.stockQuantity || 0) < item.quantity) {
+                    return res.status(400).json({
+                        message: `Insufficient stock for ${crop.name}. Available: ${crop.stockQuantity}`
+                    });
+                }
+
+                const itemPrice = crop.consumerPrice || crop.expectedPrice || 0;
+                const itemTotal = itemPrice * item.quantity;
+                totalAmount += itemTotal;
+
+                orderItems.push({
+                    crop: crop,
+                    farmer: crop.farmer,
+                    quantity: item.quantity,
+                    price: itemPrice,
+                    total: itemTotal,
+                });
+
+                updateLocalCropStock(crop._id, item.quantity);
+            }
+
+            const localOrder = createLocalOrder({
+                orderNumber: `ORD-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`.toUpperCase(),
+                buyer: req.user,
+                buyerType: 'consumer',
+                items: orderItems,
+                totalAmount,
+                deliveryAddress,
+                paymentMethod: paymentMethod || 'cod',
+                paymentStatus: /(cod|cash)/i.test(paymentMethod || 'cod') ? 'pending' : 'paid',
+                orderStatus: 'placed',
+                orderType: 'consumer',
+            });
+
+            return res.status(201).json({
+                success: true,
+                data: localOrder,
+            });
+        }
+
+        // Validate and calculate total
+        for (const item of items) {
+            const crop = await Crop.findById(item.cropId);
+
+            if (!crop || !crop.availableForConsumers) {
+                return res.status(400).json({ message: `Crop ${item.cropId} not available` });
+            }
+
+            if (crop.stockQuantity < item.quantity) {
+                return res.status(400).json({
+                    message: `Insufficient stock for ${crop.name}. Available: ${crop.stockQuantity}`
+                });
+            }
+
+            const itemPrice = crop.consumerPrice || crop.expectedPrice || 0;
+            const itemTotal = itemPrice * item.quantity;
+            totalAmount += itemTotal;
+
+            orderItems.push({
+                crop: crop._id,
+                farmer: crop.farmer,
+                quantity: item.quantity,
+                price: itemPrice,
+                total: itemTotal,
+            });
+
+            // Reduce stock
+            crop.stockQuantity -= item.quantity;
+            if (crop.stockQuantity === 0) {
+                crop.status = 'sold';
+            }
+            await crop.save();
+        }
+
+        // Generate Order Number
+        const orderNumber = `ORD-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`.toUpperCase();
+
+        // Create order
+        const order = await Order.create({
+            orderNumber,
+            buyer: req.user._id,
+            buyerType: 'consumer',
+            items: orderItems,
+            totalAmount,
+            deliveryAddress,
+            paymentMethod: paymentMethod || 'cod',
+            paymentStatus: /(cod|cash)/i.test(paymentMethod || 'cod') ? 'pending' : 'paid',
+            orderStatus: 'placed',
+            orderType: 'consumer',
+        });
+
+        const populatedOrder = await Order.findById(order._id)
+            .populate('buyer', 'name email phone')
+            .populate({
+                path: 'items.crop',
+                select: 'name category images',
+            })
+            .populate({
+                path: 'items.farmer',
+                select: 'name phone',
+            });
+
+        res.status(201).json({
+            success: true,
+            data: populatedOrder,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get consumer orders
+// @route   GET /api/marketplace/orders
+// @access  Private (Consumer)
+export const getConsumerOrders = async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) {
+            const orders = findLocalOrdersByBuyer(req.user._id);
+            return res.json({
+                success: true,
+                count: orders.length,
+                data: orders,
+            });
+        }
+
+        const orders = await Order.find({
+            buyer: req.user._id,
+            orderType: 'consumer',
+        })
+            .populate({
+                path: 'items.crop',
+                select: 'name category images',
+            })
+            .populate({
+                path: 'items.farmer',
+                select: 'name phone',
+            })
+            .sort({ createdAt: -1 });
+
+        res.json({
+            success: true,
+            count: orders.length,
+            data: orders,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get order tracking details
+// @route   GET /api/marketplace/orders/:id/track
+// @access  Private
+export const trackOrder = async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) {
+            const order = findLocalOrderById(req.params.id);
+
+            if (!order) {
+                return res.status(404).json({ message: 'Order not found' });
+            }
+
+            return res.json({ success: true, data: order });
+        }
+
+        const order = await Order.findById(req.params.id)
+            .populate('buyer', 'name email phone')
+            .populate({
+                path: 'items.crop',
+                select: 'name category images',
+            })
+            .populate({
+                path: 'items.farmer',
+                select: 'name phone address',
+            });
+
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        // Check if user is authorized to view this order
+        if (
+            order.buyer._id.toString() !== req.user._id.toString() &&
+            !order.items.some(item => item.farmer._id.toString() === req.user._id.toString()) &&
+            req.user.role !== 'admin'
+        ) {
+            return res.status(403).json({ message: 'Not authorized to view this order' });
+        }
+
+        res.json({
+            success: true,
+            data: order,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Update order status (Farmer)
+// @route   PUT /api/marketplace/orders/:id/status
+// @access  Private (Farmer)
+export const updateOrderStatus = async (req, res) => {
+    try {
+        const { status } = req.body;
+        const order = await Order.findById(req.params.id);
+
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        // Check if user is the farmer for this order
+        const isFarmer = order.items.some(
+            item => item.farmer.toString() === req.user._id.toString()
+        );
+
+        if (!isFarmer && req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Not authorized to update this order' });
+        }
+
+        order.orderStatus = status;
+
+        if (status === 'shipped') {
+            order.shippedAt = Date.now();
+        } else if (status === 'delivered') {
+            order.deliveredAt = Date.now();
+        }
+
+        await order.save();
+
+        res.json({
+            success: true,
+            data: order,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get farmer's consumer orders
+// @route   GET /api/marketplace/farmer/orders
+// @access  Private (Farmer)
+export const getFarmerConsumerOrders = async (req, res) => {
+    try {
+        const { status, search } = req.query;
+
+        if (mongoose.connection.readyState !== 1 || !/^[0-9a-fA-F]{24}$/.test(req.user._id)) {
+            let myOrders = localOrders.filter(o => 
+                o.orderType === 'consumer' && 
+                o.items.some(item => String(item.farmer?._id || item.farmer) === String(req.user._id))
+            );
+            if (status && status !== 'all') {
+                myOrders = myOrders.filter(o => o.orderStatus === status);
+            }
+            if (search) {
+                const needle = search.toLowerCase();
+                myOrders = myOrders.filter(o => 
+                    o.orderNumber.toLowerCase().includes(needle) || 
+                    (o.buyer?.name || '').toLowerCase().includes(needle)
+                );
+            }
+            // Normalize farmerTotal for local response
+            myOrders = myOrders.map(order => {
+                const farmerItems = order.items.filter(
+                    item => String(item.farmer?._id || item.farmer) === String(req.user._id)
+                );
+                return {
+                    ...order,
+                    items: farmerItems,
+                    farmerTotal: farmerItems.reduce((sum, item) => sum + item.total, 0),
+                };
+            });
+            return res.json({
+                success: true,
+                count: myOrders.length,
+                data: myOrders
+            });
+        }
+
+        // Build query to find orders containing farmer's crops
+        let query = {
+            orderType: 'consumer',
+            'items.farmer': req.user._id,
+        };
+
+        if (status && status !== 'all') {
+            query.orderStatus = status;
+        }
+
+        let orders = await Order.find(query)
+            .populate('buyer', 'name email phone')
+            .populate({
+                path: 'items.crop',
+                select: 'name category images consumerPrice',
+            })
+            .populate({
+                path: 'items.farmer',
+                select: 'name phone',
+            })
+            .sort({ createdAt: -1 });
+
+        // Filter to only show items from this farmer
+        orders = orders.map(order => {
+            const farmerItems = order.items.filter(
+                item => item.farmer._id.toString() === req.user._id.toString()
+            );
+
+            return {
+                ...order.toObject(),
+                items: farmerItems,
+                farmerTotal: farmerItems.reduce((sum, item) => sum + item.total, 0),
+            };
+        });
+
+        // Apply search filter if provided
+        if (search) {
+            const searchLower = search.toLowerCase();
+            orders = orders.filter(order =>
+                order.orderNumber.toLowerCase().includes(searchLower) ||
+                order.buyer.name.toLowerCase().includes(searchLower) ||
+                order.items.some(item =>
+                    item.crop.name.toLowerCase().includes(searchLower)
+                )
+            );
+        }
+
+        res.json({
+            success: true,
+            count: orders.length,
+            data: orders,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Update consumer order status (Farmer)
+// @route   PUT /api/marketplace/farmer/orders/:id/status
+// @access  Private (Farmer)
+export const updateConsumerOrderStatus = async (req, res) => {
+    try {
+        const { status, notes } = req.body;
+
+        if (mongoose.connection.readyState !== 1 || !/^[0-9a-fA-F]{24}$/.test(req.params.id)) {
+            const order = findLocalOrderById(req.params.id);
+            if (!order) {
+                return res.status(404).json({ message: 'Order not found' });
+            }
+            order.orderStatus = status;
+            order.statusHistory = order.statusHistory || [];
+            order.statusHistory.push({
+                status,
+                timestamp: Date.now(),
+                notes: notes || `Order ${status} by farmer`,
+            });
+            if (status === 'confirmed') order.confirmedAt = Date.now();
+            if (status === 'shipped') order.shippedAt = Date.now();
+            if (status === 'delivered') {
+                order.deliveredAt = Date.now();
+                order.paymentStatus = 'paid';
+            }
+            return res.json({
+                success: true,
+                data: order,
+            });
+        }
+
+        const order = await Order.findById(req.params.id);
+
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        // Check if user is the farmer for this order
+        const isFarmer = order.items.some(
+            item => item.farmer.toString() === req.user._id.toString()
+        );
+
+        if (!isFarmer) {
+            return res.status(403).json({ message: 'Not authorized to update this order' });
+        }
+
+        // Update order status
+        order.orderStatus = status;
+
+        // Add to status history
+        order.statusHistory.push({
+            status,
+            timestamp: Date.now(),
+            notes: notes || `Order ${status} by farmer`,
+        });
+
+        // Update specific timestamps
+        if (status === 'confirmed') {
+            order.confirmedAt = Date.now();
+        } else if (status === 'shipped') {
+            order.shippedAt = Date.now();
+        } else if (status === 'delivered') {
+            order.deliveredAt = Date.now();
+            order.paymentStatus = 'paid'; // Mark as paid on delivery for COD
+        }
+
+        await order.save();
+
+        // Populate for response
+        await order.populate('buyer', 'name email phone');
+        await order.populate({
+            path: 'items.crop',
+            select: 'name category images',
+        });
+        await order.populate({
+            path: 'items.farmer',
+            select: 'name phone',
+        });
+
+        res.json({
+            success: true,
+            data: order,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Add tracking info to order
+// @route   PUT /api/marketplace/farmer/orders/:id/tracking
+// @access  Private (Farmer)
+export const addTrackingInfo = async (req, res) => {
+    try {
+        const { courierName, trackingNumber, estimatedDelivery } = req.body;
+
+        if (mongoose.connection.readyState !== 1 || !/^[0-9a-fA-F]{24}$/.test(req.params.id)) {
+            const order = findLocalOrderById(req.params.id);
+            if (!order) {
+                return res.status(404).json({ message: 'Order not found' });
+            }
+            order.trackingInfo = {
+                courierName,
+                trackingNumber,
+                estimatedDelivery: estimatedDelivery ? new Date(estimatedDelivery) : undefined,
+            };
+            if (order.orderStatus === 'packed' || order.orderStatus === 'processing') {
+                order.orderStatus = 'shipped';
+                order.shippedAt = Date.now();
+                order.statusHistory = order.statusHistory || [];
+                order.statusHistory.push({
+                    status: 'shipped',
+                    timestamp: Date.now(),
+                    notes: `Shipped via ${courierName}`,
+                });
+            }
+            return res.json({
+                success: true,
+                data: order,
+            });
+        }
+
+        const order = await Order.findById(req.params.id);
+
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        // Check if user is the farmer for this order
+        const isFarmer = order.items.some(
+            item => item.farmer.toString() === req.user._id.toString()
+        );
+
+        if (!isFarmer) {
+            return res.status(403).json({ message: 'Not authorized to update this order' });
+        }
+
+        // Update tracking info
+        order.trackingInfo = {
+            courierName,
+            trackingNumber,
+            estimatedDelivery: estimatedDelivery ? new Date(estimatedDelivery) : undefined,
+        };
+
+        // If adding tracking, update status to shipped if not already
+        if (order.orderStatus === 'packed' || order.orderStatus === 'processing') {
+            order.orderStatus = 'shipped';
+            order.shippedAt = Date.now();
+            order.statusHistory.push({
+                status: 'shipped',
+                timestamp: Date.now(),
+                notes: `Shipped via ${courierName}`,
+            });
+        }
+
+        await order.save();
+
+        // Populate for response
+        await order.populate('buyer', 'name email phone');
+        await order.populate({
+            path: 'items.crop',
+            select: 'name category images',
+        });
+        await order.populate({
+            path: 'items.farmer',
+            select: 'name phone',
+        });
+
+        res.json({
+            success: true,
+            data: order,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Cancel consumer order
+// @route   PUT /api/marketplace/orders/:id/cancel
+// @access  Private (Consumer)
+export const cancelConsumerOrder = async (req, res) => {
+    try {
+        const { reason } = req.body;
+
+        if (mongoose.connection.readyState !== 1 || !/^[0-9a-fA-F]{24}$/.test(req.params.id)) {
+            const order = findLocalOrderById(req.params.id);
+            if (!order) {
+                return res.status(404).json({ message: 'Order not found' });
+            }
+            if (String(order.buyer?._id || order.buyer) !== String(req.user._id)) {
+                return res.status(403).json({ message: 'Not authorized to cancel this order' });
+            }
+            order.orderStatus = 'cancelled';
+            order.cancelledAt = Date.now();
+            order.cancellationReason = reason || 'Cancelled by user';
+            order.statusHistory = order.statusHistory || [];
+            order.statusHistory.push({
+                status: 'cancelled',
+                timestamp: Date.now(),
+                notes: order.cancellationReason
+            });
+            return res.json({
+                success: true,
+                message: 'Order cancelled successfully',
+                data: order
+            });
+        }
+
+        const order = await Order.findById(req.params.id);
+
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        // Check authorization
+        if (order.buyer.toString() !== req.user._id.toString()) {
+            return res.status(403).json({ message: 'Not authorized to cancel this order' });
+        }
+
+        // Check if order can be cancelled
+        if (['shipped', 'out_for_delivery', 'delivered', 'cancelled'].includes(order.orderStatus)) {
+            return res.status(400).json({
+                message: `Cannot cancel order in ${order.orderStatus} status`
+            });
+        }
+
+        order.orderStatus = 'cancelled';
+        order.cancelledAt = Date.now();
+        order.cancellationReason = reason || 'Cancelled by user';
+
+        // Add to history
+        order.statusHistory.push({
+            status: 'cancelled',
+            timestamp: Date.now(),
+            notes: order.cancellationReason
+        });
+
+        // Restore stock logic could go here (optional for now)
+
+        await order.save();
+
+        res.json({
+            success: true,
+            message: 'Order cancelled successfully',
+            data: order
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};

@@ -1,0 +1,287 @@
+import express from 'express';
+import dotenv from 'dotenv';
+import cors from 'cors';
+import morgan from 'morgan';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import passport from 'passport';
+import session from 'express-session';
+import User from './models/User.js';
+import dns from 'dns';
+
+// Configure public DNS to resolve MongoDB Atlas SRV records
+try {
+    dns.setServers(['8.8.8.8', '8.8.4.4']);
+} catch (e) {
+    console.warn('DNS override failed:', e.message);
+}
+
+// Load environment variables
+dotenv.config();
+
+// Import database connection
+import connectDB from './config/db.js';
+
+// Import passport configuration
+import configurePassport from './config/passport.js';
+
+// Import routes
+import authRoutes from './routes/authRoutes.js';
+import cropRoutes from './routes/cropRoutes.js';
+import sampleRoutes from './routes/sampleRoutes.js';
+import negotiationRoutes from './routes/negotiationRoutes.js';
+import orderRoutes from './routes/orderRoutes.js';
+import chatRoutes from './routes/chatRoutes.js';
+import adminRoutes from './routes/adminRoutes.js';
+import couponRoutes from './routes/couponRoutes.js';
+import marketplaceRoutes from './routes/marketplaceRoutes.js';
+import wholesaleOrderRoutes from './routes/wholesaleOrderRoutes.js';
+import passwordResetRoutes from './routes/passwordResetRoutes.js';
+
+// ES Module fix for __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Connect to database
+connectDB();
+
+// Initialize Express app
+const app = express();
+
+// Create HTTP server
+const httpServer = createServer(app);
+
+// Initialize Socket.io
+const io = new Server(httpServer, {
+    cors: {
+        origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+        methods: ['GET', 'POST'],
+        credentials: true
+    },
+});
+
+
+// Middleware
+app.use(cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    credentials: true
+}));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(morgan('dev'));
+
+// Session middleware for passport
+app.use(
+    session({
+        secret: process.env.SESSION_SECRET || 'agrimart_secret_key_2026',
+        resave: false,
+        saveUninitialized: false,
+        cookie: {
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        },
+    })
+);
+
+// Initialize Passport
+app.use(passport.initialize());
+app.use(passport.session());
+configurePassport();
+
+// Create uploads directory if it doesn't exist
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Serve static files (uploaded images/videos)
+app.use('/uploads', express.static(uploadsDir));
+
+// API Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/auth', passwordResetRoutes);
+app.use('/api/crops', cropRoutes);
+app.use('/api/samples', sampleRoutes);
+app.use('/api/negotiations', negotiationRoutes);
+app.use('/api/orders', orderRoutes);
+app.use('/api/chats', chatRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/coupons', couponRoutes);
+app.use('/api/marketplace', marketplaceRoutes);
+app.use('/api/wholesale-orders', (req, res, next) => {
+    console.log(`\n🔵 Wholesale Order Request: ${req.method} ${req.url}`);
+    console.log('Body:', req.body);
+    console.log('User:', req.user?.email || 'Not authenticated');
+    next();
+}, wholesaleOrderRoutes);
+
+app.get('/api/seed', async (req, res) => {
+    try {
+        const farmer = await User.findOne({ email: 'farmer@test.com' });
+        if (!farmer) {
+            await User.create({
+                name: 'Ramesh Farmer',
+                email: 'farmer@test.com',
+                password: 'password123',
+                phone: '9876543210',
+                role: 'farmer',
+                address: { street: '123 Village', village: 'Guntur', district: 'Guntur', state: 'AP', pincode: '522001' },
+                region: 'South India'
+            });
+        }
+        const consumer = await User.findOne({ email: 'consumer@test.com' });
+        if (!consumer) {
+            await User.create({
+                name: 'Test Consumer',
+                email: 'consumer@test.com',
+                password: 'password123',
+                phone: '9000000000',
+                role: 'consumer'
+            });
+        }
+        const admin = await User.findOne({ email: 'admin@test.com' });
+        if (!admin) {
+            await User.create({
+                name: 'Super Admin',
+                email: 'admin@test.com',
+                password: 'password123',
+                phone: '9111111111',
+                role: 'admin'
+            });
+        }
+        const superadmin = await User.findOne({ email: 'superadmin@agrimart.com' });
+        if (!superadmin) {
+            await User.create({
+                name: 'Main Admin',
+                email: 'superadmin@agrimart.com',
+                password: 'Admin@2026',
+                phone: '9333333333',
+                role: 'admin'
+            });
+        }
+        const wholesaler = await User.findOne({ email: 'wholesaler@test.com' });
+        if (!wholesaler) {
+            await User.create({
+                name: 'Main Wholesaler',
+                email: 'wholesaler@test.com',
+                password: 'password123',
+                phone: '9222222222',
+                role: 'wholesaler',
+                region: 'South India'
+            });
+        }
+        res.json({
+            message: 'Database Seeded Successfully!',
+            credentials: {
+                farmer: 'farmer@test.com / password123',
+                consumer: 'consumer@test.com / password123',
+                admin: 'superadmin@agrimart.com / Admin@2026',
+                wholesaler: 'wholesaler@test.com / password123'
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Root route
+app.get('/', (req, res) => {
+    res.json({
+        message: 'Welcome to AgriMart API',
+        version: '1.0.0',
+        endpoints: {
+            auth: '/api/auth',
+            crops: '/api/crops',
+            samples: '/api/samples',
+            negotiations: '/api/negotiations',
+            orders: '/api/orders',
+            chats: '/api/chats',
+            admin: '/api/admin',
+        },
+    });
+});
+
+// Socket.io connection handling
+io.on('connection', (socket) => {
+    console.log('✅ New client connected:', socket.id);
+
+    // Join negotiation room
+    socket.on('join_negotiation', (negotiationId) => {
+        socket.join(`negotiation_${negotiationId}`);
+        console.log(`User joined negotiation room: ${negotiationId}`);
+    });
+
+    // Handle new message
+    socket.on('send_message', (data) => {
+        const { negotiationId, message } = data;
+        // Broadcast to all users in the negotiation room
+        io.to(`negotiation_${negotiationId}`).emit('new_message', message);
+    });
+
+    // Handle new offer
+    socket.on('new_offer', (data) => {
+        const { negotiationId, offer } = data;
+        io.to(`negotiation_${negotiationId}`).emit('offer_update', offer);
+    });
+
+    // Handle order status update
+    socket.on('order_status_update', (data) => {
+        const { orderId, status } = data;
+        io.to(`order_${orderId}`).emit('status_changed', status);
+    });
+
+    // Leave negotiation room
+    socket.on('leave_negotiation', (negotiationId) => {
+        socket.leave(`negotiation_${negotiationId}`);
+        console.log(`User left negotiation room: ${negotiationId}`);
+    });
+
+    socket.on('disconnect', () => {
+        console.log('❌ Client disconnected:', socket.id);
+    });
+});
+
+// Make io accessible to routes
+app.set('io', io);
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({
+        message: 'Something went wrong!',
+        error: process.env.NODE_ENV === 'development' ? err.message : undefined,
+    });
+});
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({ message: 'Route not found' });
+});
+
+// Start server
+const PORT = process.env.PORT || 5006;
+
+httpServer.listen(PORT, () => {
+    console.log(`
+  🌾 AgriMart Backend Server Running 🌾
+   Port: ${PORT} 
+   Environment: ${process.env.NODE_ENV || 'development'} 
+   Database: MongoDB           
+   Socket.io: Enabled 
+  `);
+});
+
+// Global error handlers to prevent crashes
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('💥 Uncaught Exception:', error.message);
+    console.error(error.stack);
+});
+
+export default app;

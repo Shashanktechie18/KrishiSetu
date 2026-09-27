@@ -1,0 +1,389 @@
+import User from '../models/User.js';
+import Crop from '../models/Crop.js';
+import Order from '../models/Order.js';
+import Negotiation from '../models/Negotiation.js';
+import mongoose from 'mongoose';
+import { localUsers } from '../utils/localData.js';
+
+// @desc    Get all users
+// @route   GET /api/admin/users
+// @access  Private (Admin only)
+export const getAllUsers = async (req, res) => {
+    try {
+        const { role, isVerified } = req.query;
+
+        let query = {};
+        if (role) query.role = role;
+        if (isVerified !== undefined) query.isVerified = isVerified === 'true';
+
+        const users = await User.find(query).select('-password').sort({ createdAt: -1 });
+
+        res.json({
+            success: true,
+            count: users.length,
+            data: users,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Verify user (farmer/wholesaler)
+// @route   PUT /api/admin/users/:id/verify
+// @access  Private (Admin only)
+export const verifyUser = async (req, res) => {
+    try {
+        const { isVerified, rejectionReason } = req.body;
+        const targetVerified = isVerified !== undefined ? isVerified : true;
+
+        if (mongoose.connection.readyState !== 1 || !/^[0-9a-fA-F]{24}$/.test(req.params.id)) {
+            const user = localUsers.find(u => String(u._id) === String(req.params.id));
+            if (!user) {
+                return res.status(404).json({ message: 'User not found' });
+            }
+            user.isVerified = targetVerified;
+            if (rejectionReason) {
+                user.rejectionReason = rejectionReason;
+            }
+            return res.json({
+                success: true,
+                data: user,
+            });
+        }
+
+        const user = await User.findById(req.params.id);
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        user.isVerified = targetVerified;
+        if (rejectionReason) {
+            user.rejectionReason = rejectionReason;
+        }
+
+        await user.save();
+
+        res.json({
+            success: true,
+            data: user,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get user verification requests
+// @route   GET /api/admin/verification-requests
+// @access  Private (Admin only)
+export const getVerificationRequests = async (req, res) => {
+    try {
+        const { status } = req.query;
+        let query = {
+            role: { $in: ['farmer', 'wholesaler'] }
+        };
+
+        if (status === 'verified') {
+            query.isVerified = true;
+        } else {
+            query.isVerified = false;
+        }
+
+        if (mongoose.connection.readyState !== 1) {
+            const users = localUsers.filter(u => 
+                ['farmer', 'wholesaler'].includes(u.role) && 
+                u.isVerified === (status === 'verified')
+            );
+            return res.json({
+                success: true,
+                count: users.length,
+                data: users
+            });
+        }
+
+        const users = await User.find(query).select('-password').sort({ createdAt: -1 });
+
+        res.json({
+            success: true,
+            count: users.length,
+            data: users,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get pending crop approvals
+// @route   GET /api/admin/crops/pending
+// @access  Private (Admin only)
+export const getPendingCrops = async (req, res) => {
+    try {
+        const crops = await Crop.find({ status: 'pending' })
+            .populate('farmer', 'name email phone region')
+            .sort({ createdAt: -1 });
+
+        res.json({
+            success: true,
+            count: crops.length,
+            data: crops,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get platform analytics
+// @route   GET /api/admin/analytics
+// @access  Private (Admin only)
+export const getAnalytics = async (req, res) => {
+    try {
+        // User statistics
+        const totalUsers = await User.countDocuments();
+        const farmerCount = await User.countDocuments({ role: 'farmer' });
+        const wholesalerCount = await User.countDocuments({ role: 'wholesaler' });
+        const consumerCount = await User.countDocuments({ role: 'consumer' });
+        const verifiedFarmers = await User.countDocuments({
+            role: 'farmer',
+            isVerified: true,
+        });
+        const verifiedWholesalers = await User.countDocuments({
+            role: 'wholesaler',
+            isVerified: true,
+        });
+
+        // Crop statistics
+        const totalCrops = await Crop.countDocuments();
+        const activeCrops = await Crop.countDocuments({ status: 'approved' });
+        const pendingCrops = await Crop.countDocuments({ status: 'pending' });
+        const soldCrops = await Crop.countDocuments({ status: 'sold' });
+
+        // Order statistics
+        const totalOrders = await Order.countDocuments();
+        const completedOrders = await Order.countDocuments({ orderStatus: 'delivered' });
+        const pendingOrders = await Order.countDocuments({
+            orderStatus: { $in: ['placed', 'confirmed', 'processing', 'shipped'] },
+        });
+
+        // Revenue calculation
+        const revenueData = await Order.aggregate([
+            { $match: { paymentStatus: 'paid' } },
+            {
+                $group: {
+                    _id: null,
+                    totalRevenue: { $sum: '$totalAmount' },
+                },
+            },
+        ]);
+
+        const totalRevenue = revenueData.length > 0 ? revenueData[0].totalRevenue : 0;
+
+        // Negotiation statistics
+        const totalNegotiations = await Negotiation.countDocuments();
+        const successfulNegotiations = await Negotiation.countDocuments({
+            status: 'accepted',
+        });
+
+        // Seasonal crop distribution
+        const seasonalDistribution = await Crop.aggregate([
+            { $match: { status: 'approved' } },
+            {
+                $group: {
+                    _id: '$season',
+                    count: { $sum: 1 },
+                },
+            },
+        ]);
+
+        // Category distribution
+        const categoryDistribution = await Crop.aggregate([
+            { $match: { status: 'approved' } },
+            {
+                $group: {
+                    _id: '$category',
+                    count: { $sum: 1 },
+                },
+            },
+        ]);
+
+        res.json({
+            success: true,
+            data: {
+                users: {
+                    total: totalUsers,
+                    farmers: farmerCount,
+                    wholesalers: wholesalerCount,
+                    consumers: consumerCount,
+                    verifiedFarmers,
+                    verifiedWholesalers,
+                },
+                crops: {
+                    total: totalCrops,
+                    active: activeCrops,
+                    pending: pendingCrops,
+                    sold: soldCrops,
+                },
+                orders: {
+                    total: totalOrders,
+                    completed: completedOrders,
+                    pending: pendingOrders,
+                },
+                revenue: {
+                    total: totalRevenue,
+                },
+                negotiations: {
+                    total: totalNegotiations,
+                    successful: successfulNegotiations,
+                    successRate:
+                        totalNegotiations > 0
+                            ? ((successfulNegotiations / totalNegotiations) * 100).toFixed(2)
+                            : 0,
+                },
+                seasonalDistribution,
+                categoryDistribution,
+            },
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get seasonal demand reports
+// @route   GET /api/admin/reports/seasonal
+// @access  Private (Admin only)
+export const getSeasonalReport = async (req, res) => {
+    try {
+        const { season, state } = req.query;
+
+        let matchQuery = {};
+        if (season) matchQuery.season = season;
+        if (state) matchQuery['location.state'] = state;
+
+        const report = await Crop.aggregate([
+            { $match: matchQuery },
+            {
+                $group: {
+                    _id: {
+                        season: '$season',
+                        category: '$category',
+                        state: '$location.state',
+                    },
+                    totalListings: { $sum: 1 },
+                    totalQuantity: { $sum: '$quantity.value' },
+                    avgPrice: { $avg: '$expectedPrice' },
+                    minPrice: { $min: '$expectedPrice' },
+                    maxPrice: { $max: '$expectedPrice' },
+                },
+            },
+            {
+                $sort: { totalListings: -1 },
+            },
+        ]);
+
+        res.json({
+            success: true,
+            data: report,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get price trends
+// @route   GET /api/admin/reports/price-trends
+// @access  Private (Admin only)
+export const getPriceTrends = async (req, res) => {
+    try {
+        const { cropName, state, days = 30 } = req.query;
+
+        const dateLimit = new Date();
+        dateLimit.setDate(dateLimit.getDate() - parseInt(days));
+
+        let matchQuery = {
+            createdAt: { $gte: dateLimit },
+        };
+
+        if (cropName) matchQuery.name = cropName;
+        if (state) matchQuery['location.state'] = state;
+
+        const trends = await Crop.aggregate([
+            { $match: matchQuery },
+            {
+                $group: {
+                    _id: {
+                        name: '$name',
+                        date: {
+                            $dateToString: { format: '%Y-%m-%d', date: '$createdAt' },
+                        },
+                    },
+                    avgPrice: { $avg: '$expectedPrice' },
+                    count: { $sum: 1 },
+                },
+            },
+            {
+                $sort: { '_id.date': 1 },
+            },
+        ]);
+
+        res.json({
+            success: true,
+            data: trends,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Get recent negotiations
+// @route   GET /api/admin/negotiations/recent
+// @access  Private (Admin only)
+export const getRecentNegotiations = async (req, res) => {
+    try {
+        const negotiations = await Negotiation.find()
+            .sort({ updatedAt: -1 })
+            .limit(10)
+            .populate('crop', 'name images')
+            .populate('farmer', 'name email phone region')
+            .populate('wholesaler', 'name email phone company');
+
+        res.json({
+            success: true,
+            count: negotiations.length,
+            data: negotiations,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
+// @desc    Update user status (activate/deactivate)
+// @route   PUT /api/admin/users/:id/status
+// @access  Private (Admin only)
+export const updateUserStatus = async (req, res) => {
+    try {
+        const { isActive } = req.body;
+        const user = await User.findById(req.params.id);
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        user.isActive = isActive;
+        await user.save();
+
+        res.json({
+            success: true,
+            data: user,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};

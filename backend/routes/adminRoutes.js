@@ -1,0 +1,41 @@
+import express from 'express';
+import {
+    getAllUsers,
+    verifyUser,
+    getPendingCrops,
+    getAnalytics,
+    getSeasonalReport,
+    getPriceTrends,
+    getRecentNegotiations,
+    updateUserStatus,
+    getVerificationRequests,
+} from '../controllers/adminController.js';
+import { protect, authorize } from '../middleware/authMiddleware.js';
+
+const router = express.Router();
+
+// All routes are admin only
+router.use(protect);
+router.use(authorize('admin'));
+
+// User management
+router.get('/users', getAllUsers);
+router.get('/verification-requests', getVerificationRequests);
+router.put('/users/:id/verify', verifyUser);
+router.put('/verify-user/:id', verifyUser);
+router.put('/users/:id/status', updateUserStatus);
+
+// Crop management
+router.get('/crops/pending', getPendingCrops);
+
+// Analytics
+router.get('/analytics', getAnalytics);
+
+// Reports
+router.get('/reports/seasonal', getSeasonalReport);
+router.get('/reports/price-trends', getPriceTrends);
+
+// Negotiation management
+router.get('/negotiations/recent', getRecentNegotiations);
+
+export default router;
